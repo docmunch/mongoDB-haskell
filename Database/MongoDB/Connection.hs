@@ -48,7 +48,7 @@ import System.IO.Pipeline (close, isClosed)
 adminCommand :: Command -> Pipe -> IO Document
 -- ^ Run command against admin database on server connected to pipe. Fail if connection fails.
 adminCommand cmd pipe =
-    liftIOE failureToIOError $ access pipe slaveOk "admin" $ runCommand cmd
+    liftIOE failureToIOError $ access pipe Nothing slaveOk "admin" $ runCommand cmd
  where
     failureToIOError (ConnectionFailure e) = e
     failureToIOError e = userError $ show e

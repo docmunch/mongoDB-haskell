@@ -49,7 +49,7 @@ import Prelude hiding (lookup)
 import Control.Exception (Exception, throwIO)
 import Control.Monad (unless, replicateM, liftM)
 import Data.Int (Int32)
-import Data.Maybe (listToMaybe, catMaybes)
+import Data.Maybe (listToMaybe, catMaybes, fromMaybe, isJust)
 import Data.Word (Word32)
 import Data.Monoid (mappend)
 import Data.Typeable (Typeable)
@@ -93,9 +93,9 @@ import qualified Database.MongoDB.Internal.Protocol as P
 type Action = ReaderT MongoContext
 -- ^ A monad on top of m (which must be a MonadIO) that may access the database and may fail with a DB 'Failure'
 
-access :: (MonadIO m) => Pipe -> AccessMode -> Database -> Action m a -> m a
+access :: (MonadIO m) => Pipe -> Maybe Pipe -> AccessMode -> Database -> Action m a -> m a
 -- ^ Run action against database on server at other end of pipe. Use access mode for any reads and writes. Return Left on connection failure or read/write failure.
-access myPipe myAccessMode myDatabase action = runReaderT action MongoContext{..}
+access myPipe myPipe2 myAccessMode myDatabase action = runReaderT action MongoContext{..}
 
 -- | A connection failure, or a read or write exception like cursor expired or inserting a duplicate key.
 -- Note, unexpected data from the server is not a Failure, rather it is a programming error (you should call 'error' in this case) because the client and server are incompatible and requires a programming change.
@@ -149,6 +149,7 @@ writeMode (ConfirmWrites z) = Confirm z
 -- | Values needed when executing a db operation
 data MongoContext = MongoContext {
     myPipe :: Pipe, -- ^ operations read/write to this pipelined TCP connection to a MongoDB server
+    myPipe2 :: Maybe Pipe, -- ^ optional secondary replica server used for reads
     myAccessMode :: AccessMode, -- ^ read/write operation will use this access mode
     myDatabase :: Database } -- ^ operations query/update this database
 
@@ -164,10 +165,16 @@ send ns = do
     pipe <- asks myPipe
     liftIOE ConnectionFailure $ P.send pipe ns
 
-call :: (MonadIO m) => [Notice] -> Request -> Action m (IO Reply)
+call :: (MonadIO m) => Bool -> [Notice] -> Request -> Action m (IO Reply)
 -- ^ Send notices and request as a contiguous batch to server and return reply promise, which will block when invoked until reply arrives. This call will throw 'ConnectionFailure' if pipe fails on send, and promise will throw 'ConnectionFailure' if pipe fails on receive.
-call ns r = do
-    pipe <- asks myPipe
+call isRead ns r = do
+    -- Choose the pipe:
+    pipe <- do
+        ctx <- ask
+        let p1 = myPipe ctx
+        -- If this is a read and there is a secondary, choose it. Otherwise,
+        -- choose the primary.
+        return $ if isRead then fromMaybe p1 $ myPipe2 ctx else p1
     promise <- liftIOE ConnectionFailure $ P.call pipe ns r
     return (liftIOE ConnectionFailure promise)
 
@@ -204,8 +211,14 @@ useDb db act = local (\ctx -> ctx {myDatabase = db}) act
 auth :: (MonadIO m) => Username -> Password -> Action m Bool
 -- ^ Authenticate with the current database (if server is running in secure mode). Return whether authentication was successful or not. Reauthentication is required for every new pipe.
 auth usr pss = do
-    n <- at "nonce" `liftM` runCommand ["getnonce" =: (1 :: Int)]
-    true1 "ok" `liftM` runCommand ["authenticate" =: (1 :: Int), "user" =: usr, "nonce" =: n, "key" =: pwKey n usr pss]
+    auth1 <- auth' False  -- primary
+    mp2 <- asks myPipe2
+    auth2 <- if isJust mp2 then auth' True else return True  -- secondary
+    return $ auth1 && auth2
+  where
+    auth' isRead = do
+        n <- at "nonce" `liftM` runCommand' isRead ["getnonce" =: (1 :: Int)]
+        true1 "ok" `liftM` runCommand' isRead ["authenticate" =: (1 :: Int), "user" =: usr, "nonce" =: n, "key" =: pwKey n usr pss]
 
 -- * Collection
 
@@ -257,7 +270,7 @@ write notice = asks myWriteMode >>= \mode -> case mode of
     NoConfirm -> send [notice]
     Confirm params -> do
         let q = query (("getlasterror" =: (1 :: Int)) : params) "$cmd"
-        Batch _ _ [doc] <- fulfill =<< request [notice] =<< queryRequest False q {limit = 1}
+        Batch _ _ [doc] <- fulfill =<< request False [notice] =<< queryRequest False q {limit = 1}
         case lookup "err" doc of
             Nothing -> return ()
             Just err -> liftIO $ throwIO $ WriteFailure (maybe 0 id $ lookup "code" doc) err
@@ -398,14 +411,18 @@ find :: (MonadIO m, MonadBaseControl IO m) => Query -> Action m Cursor
 -- ^ Fetch documents satisfying query
 find q@Query{selection, batchSize} = do
     db <- thisDatabase
-    dBatch <- request [] =<< queryRequest False q
+    dBatch <- request True [] =<< queryRequest False q
     newCursor db (coll selection) batchSize dBatch
+
+findOne' :: (MonadIO m) => Bool -> Query -> Action m (Maybe Document)
+-- ^ Fetch first document satisfying query or Nothing if none satisfy it
+findOne' isRead q = do
+    Batch _ _ docs <- fulfill =<< request isRead [] =<< queryRequest False q {limit = 1}
+    return (listToMaybe docs)
 
 findOne :: (MonadIO m) => Query -> Action m (Maybe Document)
 -- ^ Fetch first document satisfying query or Nothing if none satisfy it
-findOne q = do
-    Batch _ _ docs <- fulfill =<< request [] =<< queryRequest False q {limit = 1}
-    return (listToMaybe docs)
+findOne = findOne' True
 
 fetch :: (MonadIO m) => Query -> Action m Document
 -- ^ Same as 'findOne' except throw 'DocNotFound' if none match
@@ -490,18 +507,18 @@ findAndModifyOpts (Query {
 explain :: (MonadIO m) => Query -> Action m Document
 -- ^ Return performance stats of query execution
 explain q = do  -- same as findOne but with explain set to true
-    Batch _ _ docs <- fulfill =<< request [] =<< queryRequest True q {limit = 1}
+    Batch _ _ docs <- fulfill =<< request True [] =<< queryRequest True q {limit = 1}
     return $ if null docs then error ("no explain: " ++ show q) else head docs
 
 count :: (MonadIO m) => Query -> Action m Int
 -- ^ Fetch number of documents satisfying query (including effect of skip and/or limit if present)
-count Query{selection = Select sel col, skip, limit} = at "n" `liftM` runCommand
+count Query{selection = Select sel col, skip, limit} = at "n" `liftM` runCommand' True
     (["count" =: col, "query" =: sel, "skip" =: (fromIntegral skip :: Int32)]
         ++ ("limit" =? if limit == 0 then Nothing else Just (fromIntegral limit :: Int32)))
 
 distinct :: (MonadIO m) => Label -> Selection -> Action m [Value]
 -- ^ Fetch distinct values of field in selected documents
-distinct k (Select sel col) = at "values" `liftM` runCommand ["distinct" =: col, "key" =: k, "query" =: sel]
+distinct k (Select sel col) = at "values" `liftM` runCommand' True ["distinct" =: col, "key" =: k, "query" =: sel]
 
 queryRequest :: (Monad m) => Bool -> Query -> Action m (Request, Limit)
 -- ^ Translate Query to Protocol.Query. If first arg is true then add special $explain attribute.
@@ -538,10 +555,10 @@ type DelayedBatch = IO Batch
 data Batch = Batch Limit CursorId [Document]
 -- ^ CursorId = 0 means cursor is finished. Documents is remaining documents to serve in current batch. Limit is remaining limit for next fetch.
 
-request :: (MonadIO m) => [Notice] -> (Request, Limit) -> Action m DelayedBatch
+request :: (MonadIO m) => Bool -> [Notice] -> (Request, Limit) -> Action m DelayedBatch
 -- ^ Send notices and request and return promised batch
-request ns (req, remainingLimit) = do
-    promise <- call ns req
+request isRead ns (req, remainingLimit) = do
+    promise <- call isRead ns req
     return $ fromReply remainingLimit =<< promise
 
 fromReply :: Limit -> Reply -> DelayedBatch
@@ -593,7 +610,7 @@ fulfill' fcol batchSize dBatch = do
         else return b
 
 nextBatch' :: (MonadIO m) => FullCollection -> BatchSize -> Limit -> CursorId -> Action m DelayedBatch
-nextBatch' fcol batchSize limit cid = request [] (GetMore fcol batchSize' cid, remLimit)
+nextBatch' fcol batchSize limit cid = request True [] (GetMore fcol batchSize' cid, remLimit)
     where (batchSize', remLimit) = batchSizeRemainingLimit batchSize limit
 
 next :: (MonadIO m, MonadBaseControl IO m) => Cursor -> Action m (Maybe Document)
@@ -640,7 +657,7 @@ type Pipeline = [Document]
 aggregate :: MonadIO m => Collection -> Pipeline -> Action m [Document]
 -- ^ Runs an aggregate and unpacks the result. See <http://docs.mongodb.org/manual/core/aggregation/> for details.
 aggregate aColl agg = do
-    response <- runCommand ["aggregate" =: aColl, "pipeline" =: agg]
+    response <- runCommand' True ["aggregate" =: aColl, "pipeline" =: agg]
     case true1 "ok" response of
         True  -> lookup "result" response
         False -> liftIO $ throwIO $ AggregateFailure $ at "errmsg" response
@@ -672,7 +689,7 @@ groupDocument Group{..} =
 
 group :: (MonadIO m) => Group -> Action m [Document]
 -- ^ Execute group query and return resulting aggregate value for each distinct key
-group g = at "retval" `liftM` runCommand ["group" =: groupDocument g]
+group g = at "retval" `liftM` runCommand' True ["group" =: groupDocument g]
 
 -- ** MapReduce
 
@@ -755,7 +772,7 @@ runMR mr = do
 runMR' :: (MonadIO m) => MapReduce -> Action m MRResult
 -- ^ Run MapReduce and return a MR result document containing stats and the results if Inlined. Error if the map/reduce failed (because of bad Javascript).
 runMR' mr = do
-    doc <- runCommand (mrDocument mr)
+    doc <- runCommand' True (mrDocument mr)
     return $ if true1 "ok" doc then doc else error $ "mapReduce error:\n" ++ show doc ++ "\nin:\n" ++ show mr
 
 -- * Command
@@ -763,14 +780,20 @@ runMR' mr = do
 type Command = Document
 -- ^ A command is a special query or action against the database. See <http://www.mongodb.org/display/DOCS/Commands> for details.
 
+runCommand' :: (MonadIO m) => Bool -> Command -> Action m Document
+runCommand' isRead c = maybe err id `liftM` findOne' isRead (query c "$cmd") where
+    err = error $ "Nothing returned for command: " ++ show c
+
 runCommand :: (MonadIO m) => Command -> Action m Document
 -- ^ Run command against the database and return its result
-runCommand c = maybe err id `liftM` findOne (query c "$cmd") where
-    err = error $ "Nothing returned for command: " ++ show c
+runCommand = runCommand' False
+
+runCommand1' :: (MonadIO m) => Bool -> Text -> Action m Document
+runCommand1' isRead c = runCommand' isRead [c =: (1 :: Int)]
 
 runCommand1 :: (MonadIO m) => Text -> Action m Document
 -- ^ @runCommand1 foo = runCommand [foo =: 1]@
-runCommand1 c = runCommand [c =: (1 :: Int)]
+runCommand1 = runCommand1' False
 
 eval :: (MonadIO m, Val v) => Javascript -> Action m v
 -- ^ Run code on server
